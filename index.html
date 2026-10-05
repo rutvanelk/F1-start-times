@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>F1 start times</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0f0f13;
+        --panel: #18181f;
+        --border: #2e2e3a;
+        --text: #ececf1;
+        --muted: #9a9aab;
+        --accent: #e10600;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Inter, system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      header {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        gap: 16px;
+        padding: 20px 24px 8px;
+      }
+      h1 { margin: 0; font-size: 1.4rem; }
+      h1 span { color: var(--accent); }
+      p.hint { margin: 0 24px 16px; color: var(--muted); font-size: 0.9rem; }
+      label { color: var(--muted); }
+      select {
+        font: inherit;
+        color: var(--text);
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 6px 8px;
+      }
+      ol {
+        list-style: none;
+        margin: 0 auto 40px;
+        padding: 0 24px;
+        max-width: 720px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      li {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 12px 14px;
+      }
+      .place { display: block; font-size: 0.8rem; color: var(--muted); }
+      .line { font-size: 1.05rem; }
+      .status { margin: 0 24px; color: var(--muted); }
+      .error { color: #f87171; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>F1 <span>start times</span></h1>
+      <label>
+        Season
+        <select id="year"></select>
+      </label>
+    </header>
+    <p class="hint">Lights out on the F1TV replay, not the scheduled start on the timetable.</p>
+    <p id="status" class="status">Loading…</p>
+    <ol id="list"></ol>
+    <script>
+      const FIRST_YEAR = 2023;
+      const THIS_YEAR = new Date().getFullYear();
+      const yearSelect = document.getElementById("year");
+      const list = document.getElementById("list");
+      const status = document.getElementById("status");
+
+      for (let year = THIS_YEAR; year >= FIRST_YEAR; year--) {
+        const option = document.createElement("option");
+        option.value = year;
+        option.textContent = year;
+        yearSelect.append(option);
+      }
+
+      function formatTime(totalSec) {
+        if (!Number.isFinite(totalSec) || totalSec < 0) return null;
+        const s = Math.floor(totalSec);
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const sec = String(s % 60).padStart(2, "0");
+        return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+      }
+
+      function lineFor(session, startSec) {
+        const kind = session.session_name === "Sprint" ? "sprint" : "race";
+        const place = session.country_name || session.location || session.circuit_short_name;
+        const clock = formatTime(startSec);
+        if (!clock) return `No replay start time yet for the ${kind} in ${place}.`;
+        return `The ${kind} in ${place} started at ${clock}.`;
+      }
+
+      async function fetchJson(url) {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`${url} → HTTP ${response.status}`);
+        return response.json();
+      }
+
+      async function meetingStarts(meetingKey) {
+        const data = await fetchJson(`https://api.multiviewer.app/api/v1/meetings/${meetingKey}`);
+        const starts = {};
+        for (const session of data.sessions || []) {
+          if (session.session_start == null || session.session_start === "") continue;
+          starts[String(session.session_key)] = Number(session.session_start);
+        }
+        return starts;
+      }
+
+      async function load(year) {
+        list.replaceChildren();
+        status.className = "status";
+        status.textContent = "Loading…";
+        try {
+          const sessions = await fetchJson(`https://api.openf1.org/v1/sessions?year=${year}`);
+          const wanted = sessions
+            .filter((s) => (s.session_name === "Race" || s.session_name === "Sprint") && !s.is_cancelled)
+            .sort((a, b) => a.date_start.localeCompare(b.date_start));
+          const meetingKeys = [...new Set(wanted.map((s) => s.meeting_key))];
+          const byMeeting = {};
+          await Promise.all(
+            meetingKeys.map(async (key) => {
+              try {
+                byMeeting[key] = await meetingStarts(key);
+              } catch {
+                byMeeting[key] = {};
+              }
+            }),
+          );
+          const now = Date.now();
+          const rows = wanted.filter((s) => Date.parse(s.date_start) <= now);
+          if (!rows.length) {
+            status.textContent = `No races for ${year} yet.`;
+            return;
+          }
+          status.textContent = "";
+          for (const session of rows) {
+            const item = document.createElement("li");
+            const place = document.createElement("span");
+            place.className = "place";
+            place.textContent = `${session.circuit_short_name} · ${session.session_name}`;
+            const line = document.createElement("span");
+            line.className = "line";
+            line.textContent = lineFor(session, byMeeting[session.meeting_key]?.[String(session.session_key)]);
+            item.append(place, line);
+            list.append(item);
+          }
+        } catch (error) {
+          status.className = "status error";
+          status.textContent = error.message;
+        }
+      }
+
+      yearSelect.addEventListener("change", () => load(Number(yearSelect.value)));
+      load(Number(yearSelect.value));
+    </script>
+  </body>
+</html>
