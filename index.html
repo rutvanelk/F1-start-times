@@ -13,6 +13,8 @@
         --text: #ececf1;
         --muted: #9a9aab;
         --accent: #e10600;
+        --green: #4ade80;
+        --yellow: #facc15;
       }
       * { box-sizing: border-box; }
       body {
@@ -24,7 +26,7 @@
       header {
         display: flex;
         flex-wrap: wrap;
-        align-items: baseline;
+        align-items: center;
         gap: 16px;
         padding: 20px 24px 8px;
       }
@@ -32,6 +34,12 @@
       h1 span { color: var(--accent); }
       p.hint { margin: 0 24px 16px; color: var(--muted); font-size: 0.9rem; }
       label { color: var(--muted); }
+      .toggle {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        cursor: pointer;
+      }
       select {
         font: inherit;
         color: var(--text);
@@ -47,9 +55,9 @@
         max-width: 720px;
         display: flex;
         flex-direction: column;
-        gap: 8px;
+        gap: 28px;
       }
-      li {
+      li.race {
         background: var(--panel);
         border: 1px solid var(--border);
         border-radius: 10px;
@@ -57,6 +65,77 @@
       }
       .place { display: block; font-size: 0.8rem; color: var(--muted); }
       .line { font-size: 1.05rem; }
+      .happening-start,
+      .happening-finish,
+      .happening-safety {
+        margin: 1px -6px;
+        padding: 5px 8px;
+        border-radius: 6px;
+        font-size: 1rem;
+        font-weight: 600;
+      }
+      .happening-start {
+        background: rgba(74, 222, 128, 0.12);
+        box-shadow: inset 3px 0 0 var(--green);
+      }
+      .happening-start .when,
+      .happening-start .what { color: var(--green); }
+      .happening-start .what::before,
+      .happening-finish .what::before {
+        content: "";
+        display: inline-block;
+        margin-right: 0.45em;
+        vertical-align: -0.05em;
+      }
+      .happening-start .what::before {
+        width: 0.55em;
+        height: 0.55em;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 6px var(--green);
+      }
+      .happening-finish {
+        background: rgba(255, 255, 255, 0.06);
+        box-shadow: inset 3px 0 0 #f4f4f5;
+      }
+      .happening-finish .when,
+      .happening-finish .what { color: #f4f4f5; }
+      .happening-finish .what::before {
+        width: 0.85em;
+        height: 0.85em;
+        border-radius: 2px;
+        background: repeating-conic-gradient(#f4f4f5 0% 25%, #18181f 0% 50%) 0 0 / 50% 50%;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.45);
+      }
+      .happening-safety {
+        background: rgba(250, 204, 21, 0.12);
+        box-shadow: inset 3px 0 0 var(--yellow);
+      }
+      .happening-safety .when,
+      .happening-safety .what { color: var(--yellow); }
+      .happenings {
+        list-style: none;
+        margin: 10px 0 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .happening {
+        display: grid;
+        grid-template-columns: 4.6rem 1fr;
+        gap: 8px;
+        font-size: 0.92rem;
+      }
+      .when {
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .hidden-note {
+        margin: 8px 0 0;
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
       .status { margin: 0 24px; color: var(--muted); }
       .error { color: #f87171; }
     </style>
@@ -68,16 +147,30 @@
         Season
         <select id="year"></select>
       </label>
+      <label class="toggle" title="Hide safety cars, red flags and incidents">
+        <input type="checkbox" id="spoiler-free" checked />
+        Spoiler-free
+      </label>
     </header>
-    <p class="hint">Lights out on the F1TV replay, not the scheduled start on the timetable.</p>
+    <p class="hint">
+      Lights out on the F1TV replay, not the scheduled start on the timetable. Happenings use that same replay clock.
+    </p>
     <p id="status" class="status">Loading…</p>
     <ol id="list"></ol>
     <script>
       const FIRST_YEAR = 2023;
       const THIS_YEAR = new Date().getFullYear();
+      // Race control posts "noted" after the moment itself. Same rewind as the F1TV chapter list.
+      const INCIDENT_LEAD_SEC = 45;
       const yearSelect = document.getElementById("year");
+      const spoilerBox = document.getElementById("spoiler-free");
       const list = document.getElementById("list");
       const status = document.getElementById("status");
+
+      let generation = 0;
+      let rows = [];
+
+      spoilerBox.checked = localStorage.getItem("spoiler-free") !== "false";
 
       for (let year = THIS_YEAR; year >= FIRST_YEAR; year--) {
         const option = document.createElement("option");
@@ -95,6 +188,11 @@
         return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
       }
 
+      function sentenceCase(text) {
+        const cased = text.charAt(0).toUpperCase() + text.slice(1).toLowerCase();
+        return cased.replace(/\(([a-z]{3})\)/g, (_, tla) => `(${tla.toUpperCase()})`);
+      }
+
       function lineFor(session, startSec) {
         const kind = session.session_name === "Sprint" ? "sprint" : "race";
         const place = session.country_name || session.location || session.circuit_short_name;
@@ -103,10 +201,119 @@
         return `The ${kind} in ${place} started at ${clock}.`;
       }
 
-      async function fetchJson(url) {
+      function safetyLabel(upper) {
+        if (upper.startsWith("VIRTUAL SAFETY CAR DEPLOYED") || upper.startsWith("VSC DEPLOYED")) return "Virtual safety car";
+        if (upper.startsWith("VIRTUAL SAFETY CAR ENDING") || upper.startsWith("VSC ENDING")) return "Virtual safety car ends";
+        if (upper.includes("FORMATION LAP") && upper.includes("SAFETY CAR")) return "Formation lap behind the safety car";
+        if (upper.includes("BEHIND THE SAFETY CAR")) return "Race start behind the safety car";
+        if (upper.startsWith("SAFETY CAR DEPLOYED")) return "Safety car";
+        if (upper.startsWith("SAFETY CAR IN THIS LAP")) return "Safety car in this lap";
+        if (upper.startsWith("SAFETY CAR THROUGH THE PIT LANE")) return "Safety car through the pit lane";
+        if (upper.startsWith("SAFETY CAR ENDING")) return "Safety car ends";
+        if (upper.startsWith("ALL CARS MAY OVERTAKE THE SAFETY CAR")) return "Cars may pass the safety car";
+        if (upper.includes("OVERTAKE THE SAFETY CAR")) return "Lapped cars may pass the safety car";
+        return null;
+      }
+
+      function happeningsFrom(messages, startSec) {
+        const sorted = [...messages].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+        let lightsOut = null;
+        for (const message of sorted) {
+          if (message.category === "SessionStatus" && String(message.message || "").toUpperCase() === "SESSION STARTED") {
+            const at = Date.parse(message.date);
+            if (Number.isFinite(at)) {
+              lightsOut = at;
+              break;
+            }
+          }
+        }
+
+        const events = [];
+        let seenStart = false;
+
+        function push(spoiler, label, at, lap, leadSec, kind = "note") {
+          let replay = null;
+          if (Number.isFinite(startSec) && lightsOut != null && Number.isFinite(at)) {
+            replay = Math.max(0, startSec + (at - lightsOut) / 1000 - (leadSec || 0));
+          }
+          const prev = events[events.length - 1];
+          if (prev && prev.label === label && Math.abs(prev.at - at) < 1500) return;
+          events.push({
+            spoiler,
+            label,
+            kind,
+            at,
+            lap: Number.isInteger(lap) ? lap : null,
+            replay,
+          });
+        }
+
+        for (const message of sorted) {
+          const text = String(message.message || "");
+          const upper = text.toUpperCase();
+          const at = Date.parse(message.date);
+          if (!Number.isFinite(at)) continue;
+          const beforeStart = lightsOut != null && at < lightsOut;
+
+          if (message.category === "SessionStatus" && upper === "SESSION STARTED") {
+            if (!seenStart) {
+              seenStart = true;
+              continue;
+            }
+            push(true, "Restart after red flag", at, message.lap_number, 0);
+            continue;
+          }
+
+          const safety = safetyLabel(upper);
+          if (safety || message.category === "SafetyCar") {
+            push(true, safety || sentenceCase(text.split(" - ")[0]), at, message.lap_number, 0, "safety");
+            continue;
+          }
+          if (message.flag === "RED" || upper.startsWith("RED FLAG")) {
+            push(true, "Red flag", at, message.lap_number, 0);
+            continue;
+          }
+          if (beforeStart) continue;
+
+          if (message.category === "Other" && upper.includes("NOTED") && !upper.startsWith("FIA STEWARDS")) {
+            push(true, sentenceCase(text.split(" - ")[0]), at, message.lap_number, INCIDENT_LEAD_SEC);
+            continue;
+          }
+          if (upper.startsWith("ORDER FOR RESTART")) {
+            push(true, sentenceCase(text), at, message.lap_number, 0);
+            continue;
+          }
+          if (message.flag === "CHEQUERED" || upper === "CHEQUERED FLAG") {
+            push(false, "Chequered flag", at, message.lap_number, 0, "finish");
+          }
+        }
+
+        events.sort((a, b) => (a.replay ?? a.at) - (b.replay ?? b.at) || a.at - b.at);
+        return events;
+      }
+
+      async function fetchJson(url, attempt = 0) {
         const response = await fetch(url);
+        if ((response.status === 429 || response.status >= 500) && attempt < 4) {
+          await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+          return fetchJson(url, attempt + 1);
+        }
         if (!response.ok) throw new Error(`${url} → HTTP ${response.status}`);
         return response.json();
+      }
+
+      async function mapPool(items, limit, fn) {
+        const results = new Array(items.length);
+        let next = 0;
+        async function worker() {
+          while (next < items.length) {
+            const index = next++;
+            results[index] = await fn(items[index]);
+          }
+        }
+        const workers = Math.min(limit, items.length);
+        await Promise.all(Array.from({ length: workers }, () => worker()));
+        return results;
       }
 
       async function meetingStarts(meetingKey) {
@@ -119,7 +326,118 @@
         return starts;
       }
 
+      async function raceControl(session) {
+        const key = `rc-v1:${session.session_key}`;
+        try {
+          const hit = sessionStorage.getItem(key);
+          if (hit) return JSON.parse(hit);
+        } catch {
+          /* private mode or a bad cache entry */
+        }
+        let data = null;
+        let lastError = null;
+        for (let attempt = 0; attempt < 4; attempt++) {
+          try {
+            data = await fetchJson(`https://api.openf1.org/v1/race_control?session_key=${session.session_key}`);
+            break;
+          } catch (error) {
+            lastError = error;
+            await new Promise((resolve) => setTimeout(resolve, 700 * (attempt + 1)));
+          }
+        }
+        if (!data) throw lastError;
+        if (!Array.isArray(data)) throw new Error("Unexpected race control response");
+        const started = Date.parse(session.date_start);
+        const settled = Number.isFinite(started) && Date.now() - started > 2 * 24 * 3600 * 1000;
+        if (data.length || settled) {
+          try {
+            sessionStorage.setItem(key, JSON.stringify(data));
+          } catch {
+            /* ignore quota errors */
+          }
+        }
+        return data;
+      }
+
+      function render() {
+        list.replaceChildren();
+        for (const row of rows) {
+          const item = document.createElement("li");
+          item.className = "race";
+          const place = document.createElement("span");
+          place.className = "place";
+          place.textContent = `${row.session.circuit_short_name} · ${row.session.session_name}`;
+          item.append(place);
+          const startClock = formatTime(row.startSec);
+          const moments = document.createElement("ul");
+          moments.className = "happenings";
+          if (startClock) {
+            appendHappening(
+              moments,
+              "start",
+              startClock,
+              row.session.session_name === "Sprint" ? "Sprint start" : "Race start",
+            );
+          } else {
+            const line = document.createElement("span");
+            line.className = "line";
+            line.textContent = lineFor(row.session, row.startSec);
+            item.append(line);
+          }
+
+          let noteText = "";
+          let noteError = false;
+          if (row.eventsError) {
+            noteText = row.eventsError;
+            noteError = true;
+          } else if (!row.events) {
+            noteText = "Loading happenings…";
+          } else {
+            const hidden = row.events.filter((event) => event.spoiler);
+            const visible = row.events.filter((event) => !(spoilerBox.checked && event.spoiler));
+            for (const event of visible) {
+              const kind = event.kind === "finish" || event.kind === "safety" ? event.kind : "";
+              appendHappening(
+                moments,
+                kind,
+                formatTime(event.replay) || "—",
+                event.lap ? `${event.label} · lap ${event.lap}` : event.label,
+              );
+            }
+            if (spoilerBox.checked && hidden.length) {
+              const noun = hidden.length === 1 ? "happening" : "happenings";
+              noteText = `${hidden.length} ${noun} hidden (safety cars, red flags, incidents). Turn off spoiler-free to see them.`;
+            } else if (!hidden.length) {
+              noteText = "No safety cars, red flags or incidents.";
+            }
+          }
+          if (moments.childElementCount) item.append(moments);
+          if (noteText) {
+            const note = document.createElement("p");
+            note.className = noteError ? "hidden-note error" : "hidden-note";
+            note.textContent = noteText;
+            item.append(note);
+          }
+          list.append(item);
+        }
+      }
+
+      function appendHappening(parent, kind, time, label) {
+        const happening = document.createElement("li");
+        happening.className = kind ? `happening happening-${kind}` : "happening";
+        const when = document.createElement("span");
+        when.className = "when";
+        when.textContent = time;
+        const what = document.createElement("span");
+        what.className = "what";
+        what.textContent = label;
+        happening.append(when, what);
+        parent.append(happening);
+      }
+
       async function load(year) {
+        const gen = ++generation;
+        rows = [];
         list.replaceChildren();
         status.className = "status";
         status.textContent = "Loading…";
@@ -139,29 +457,56 @@
               }
             }),
           );
+          if (gen !== generation) return;
           const now = Date.now();
-          const rows = wanted.filter((s) => Date.parse(s.date_start) <= now);
-          if (!rows.length) {
+          const past = wanted.filter((s) => Date.parse(s.date_start) <= now);
+          if (!past.length) {
             status.textContent = `No races for ${year} yet.`;
             return;
           }
           status.textContent = "";
-          for (const session of rows) {
-            const item = document.createElement("li");
-            const place = document.createElement("span");
-            place.className = "place";
-            place.textContent = `${session.circuit_short_name} · ${session.session_name}`;
-            const line = document.createElement("span");
-            line.className = "line";
-            line.textContent = lineFor(session, byMeeting[session.meeting_key]?.[String(session.session_key)]);
-            item.append(place, line);
-            list.append(item);
-          }
+          rows = past.map((session) => ({
+            session,
+            startSec: byMeeting[session.meeting_key]?.[String(session.session_key)],
+            events: null,
+            eventsError: null,
+          }));
+          render();
+
+          await mapPool(rows, 2, async (row) => {
+            if (gen !== generation) return;
+            try {
+              const messages = await raceControl(row.session);
+              if (gen !== generation) return;
+              row.events = happeningsFrom(messages, row.startSec);
+            } catch {
+              if (gen !== generation) return;
+              row.eventsError = "Happenings unavailable.";
+            }
+            if (gen === generation) render();
+          });
         } catch (error) {
+          if (gen !== generation) return;
+          rows = [];
+          list.replaceChildren();
           status.className = "status error";
           status.textContent = error.message;
         }
       }
+
+      spoilerBox.addEventListener("change", () => {
+        if (spoilerBox.checked) {
+          localStorage.setItem("spoiler-free", "true");
+          render();
+          return;
+        }
+        if (!window.confirm("Reveal safety cars, red flags and incidents for each race?")) {
+          spoilerBox.checked = true;
+          return;
+        }
+        localStorage.setItem("spoiler-free", "false");
+        render();
+      });
 
       yearSelect.addEventListener("change", () => load(Number(yearSelect.value)));
       load(Number(yearSelect.value));
