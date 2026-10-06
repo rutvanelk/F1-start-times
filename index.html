@@ -127,7 +127,7 @@
           const sessions = await fetchJson(`https://api.openf1.org/v1/sessions?year=${year}`);
           const wanted = sessions
             .filter((s) => (s.session_name === "Race" || s.session_name === "Sprint") && !s.is_cancelled)
-            .sort((a, b) => a.date_start.localeCompare(b.date_start));
+            .sort((a, b) => b.date_start.localeCompare(a.date_start));
           const meetingKeys = [...new Set(wanted.map((s) => s.meeting_key))];
           const byMeeting = {};
           await Promise.all(
