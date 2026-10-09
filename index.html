@@ -138,6 +138,15 @@
       }
       .status { margin: 0 24px; color: var(--muted); }
       .error { color: #f87171; }
+      button.retry {
+        font: inherit;
+        color: var(--text);
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 2px 8px;
+        cursor: pointer;
+      }
     </style>
   </head>
   <body>
@@ -292,13 +301,91 @@
         return events;
       }
 
-      async function fetchJson(url, attempt = 0) {
-        const response = await fetch(url);
-        if ((response.status === 429 || response.status >= 500) && attempt < 4) {
-          await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
-          return fetchJson(url, attempt + 1);
+      function wait(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      function explain(error) {
+        if (error instanceof TypeError) {
+          return "Couldn't reach OpenF1. The free API often pauses while a session is live. Try again after it finishes.";
         }
-        if (!response.ok) throw new Error(`${url} → HTTP ${response.status}`);
+        return error.message || "Couldn't reach OpenF1.";
+      }
+
+      function setStatus(text, { error = false, retry = false } = {}) {
+        status.className = error ? "status error" : "status";
+        status.replaceChildren();
+        if (text) status.append(document.createTextNode(text));
+        if (retry) {
+          if (text) status.append(document.createTextNode(" "));
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "retry";
+          button.textContent = "Try again";
+          button.addEventListener("click", () => load(Number(yearSelect.value)));
+          status.append(button);
+        }
+      }
+
+      function cacheKey(year) {
+        return `season-v1:${year}`;
+      }
+
+      function readCache(year) {
+        try {
+          const data = JSON.parse(localStorage.getItem(cacheKey(year)) || "null");
+          if (!data || !Array.isArray(data.sessions)) return null;
+          return data;
+        } catch {
+          return null;
+        }
+      }
+
+      function writeCache(year, sessions, byMeeting) {
+        try {
+          localStorage.setItem(cacheKey(year), JSON.stringify({ sessions, byMeeting }));
+        } catch {
+          /* ignore quota errors */
+        }
+      }
+
+      async function fetchJson(url, attempt = 0, maxAttempts = 3) {
+        let response;
+        try {
+          response = await fetch(url);
+        } catch (error) {
+          if (attempt + 1 < maxAttempts) {
+            await wait(600 * (attempt + 1));
+            return fetchJson(url, attempt + 1, maxAttempts);
+          }
+          throw error;
+        }
+        if (response.status === 429 && attempt + 1 < maxAttempts) {
+          const retryAfter = Number(response.headers.get("retry-after"));
+          const seconds = Number.isFinite(retryAfter) ? Math.min(Math.max(retryAfter, 1), 5) : 2;
+          await wait(seconds * 1000);
+          return fetchJson(url, attempt + 1, maxAttempts);
+        }
+        if (response.status >= 500 && attempt + 1 < maxAttempts) {
+          await wait(800 * (attempt + 1));
+          return fetchJson(url, attempt + 1, maxAttempts);
+        }
+        if (!response.ok) {
+          let detail = "";
+          try {
+            const body = await response.json();
+            detail = String(body.detail || body.error || "");
+          } catch {
+            /* non-JSON error page */
+          }
+          if (response.status === 401 || response.status === 403 || /restricted|session in progress/i.test(detail)) {
+            throw new Error("OpenF1 is locked while a session is live. Try again after it finishes.");
+          }
+          if (response.status === 429) {
+            throw new Error("OpenF1 is busy. Try again in a minute.");
+          }
+          throw new Error(detail || `OpenF1 returned HTTP ${response.status}.`);
+        }
         return response.json();
       }
 
@@ -317,7 +404,7 @@
       }
 
       async function meetingStarts(meetingKey) {
-        const data = await fetchJson(`https://api.multiviewer.app/api/v1/meetings/${meetingKey}`);
+        const data = await fetchJson(`https://api.multiviewer.app/api/v1/meetings/${meetingKey}`, 0, 2);
         const starts = {};
         for (const session of data.sessions || []) {
           if (session.session_start == null || session.session_start === "") continue;
@@ -334,18 +421,11 @@
         } catch {
           /* private mode or a bad cache entry */
         }
-        let data = null;
-        let lastError = null;
-        for (let attempt = 0; attempt < 4; attempt++) {
-          try {
-            data = await fetchJson(`https://api.openf1.org/v1/race_control?session_key=${session.session_key}`);
-            break;
-          } catch (error) {
-            lastError = error;
-            await new Promise((resolve) => setTimeout(resolve, 700 * (attempt + 1)));
-          }
-        }
-        if (!data) throw lastError;
+        const data = await fetchJson(
+          `https://api.openf1.org/v1/race_control?session_key=${session.session_key}`,
+          0,
+          1,
+        );
         if (!Array.isArray(data)) throw new Error("Unexpected race control response");
         const started = Date.parse(session.date_start);
         const settled = Number.isFinite(started) && Date.now() - started > 2 * 24 * 3600 * 1000;
@@ -435,62 +515,86 @@
         parent.append(happening);
       }
 
+      function racesOf(sessions) {
+        const now = Date.now();
+        return sessions
+          .filter((s) => (s.session_name === "Race" || s.session_name === "Sprint") && !s.is_cancelled)
+          .filter((s) => Date.parse(s.date_start) <= now)
+          .sort((a, b) => b.date_start.localeCompare(a.date_start));
+      }
+
+      function showRaces(sessions, byMeeting) {
+        const past = racesOf(sessions);
+        if (!past.length) return false;
+        rows = past.map((session) => ({
+          session,
+          startSec: byMeeting[session.meeting_key]?.[String(session.session_key)],
+          events: null,
+          eventsError: null,
+        }));
+        render();
+        return true;
+      }
+
+      async function loadHappenings(gen) {
+        await mapPool(rows, 2, async (row) => {
+          if (gen !== generation) return;
+          try {
+            const messages = await raceControl(row.session);
+            if (gen !== generation) return;
+            row.events = happeningsFrom(messages, row.startSec);
+          } catch {
+            if (gen !== generation) return;
+            row.eventsError = "Happenings unavailable.";
+          }
+          if (gen === generation) render();
+        });
+      }
+
       async function load(year) {
         const gen = ++generation;
         rows = [];
         list.replaceChildren();
-        status.className = "status";
-        status.textContent = "Loading…";
+        setStatus("Loading…");
         try {
           const sessions = await fetchJson(`https://api.openf1.org/v1/sessions?year=${year}`);
-          const wanted = sessions
-            .filter((s) => (s.session_name === "Race" || s.session_name === "Sprint") && !s.is_cancelled)
-            .sort((a, b) => b.date_start.localeCompare(a.date_start));
+          const wanted = sessions.filter(
+            (s) => (s.session_name === "Race" || s.session_name === "Sprint") && !s.is_cancelled,
+          );
           const meetingKeys = [...new Set(wanted.map((s) => s.meeting_key))];
           const byMeeting = {};
-          await Promise.all(
-            meetingKeys.map(async (key) => {
-              try {
-                byMeeting[key] = await meetingStarts(key);
-              } catch {
-                byMeeting[key] = {};
-              }
-            }),
-          );
+          await mapPool(meetingKeys, 4, async (key) => {
+            try {
+              byMeeting[key] = await meetingStarts(key);
+            } catch {
+              byMeeting[key] = {};
+            }
+          });
           if (gen !== generation) return;
-          const now = Date.now();
-          const past = wanted.filter((s) => Date.parse(s.date_start) <= now);
-          if (!past.length) {
-            status.textContent = `No races for ${year} yet.`;
+          const previous = readCache(year);
+          const merged = { ...(previous?.byMeeting || {}) };
+          for (const [key, starts] of Object.entries(byMeeting)) {
+            if (starts && Object.keys(starts).length) merged[key] = starts;
+            else if (!merged[key]) merged[key] = {};
+          }
+          writeCache(year, wanted, merged);
+          if (!showRaces(wanted, merged)) {
+            setStatus(`No races for ${year} yet.`);
             return;
           }
-          status.textContent = "";
-          rows = past.map((session) => ({
-            session,
-            startSec: byMeeting[session.meeting_key]?.[String(session.session_key)],
-            events: null,
-            eventsError: null,
-          }));
-          render();
-
-          await mapPool(rows, 2, async (row) => {
-            if (gen !== generation) return;
-            try {
-              const messages = await raceControl(row.session);
-              if (gen !== generation) return;
-              row.events = happeningsFrom(messages, row.startSec);
-            } catch {
-              if (gen !== generation) return;
-              row.eventsError = "Happenings unavailable.";
-            }
-            if (gen === generation) render();
-          });
+          setStatus("");
+          await loadHappenings(gen);
         } catch (error) {
           if (gen !== generation) return;
+          const cached = readCache(year);
+          if (cached && showRaces(cached.sessions, cached.byMeeting || {})) {
+            setStatus("Showing saved times. OpenF1 didn't respond.", { retry: true });
+            await loadHappenings(gen);
+            return;
+          }
           rows = [];
           list.replaceChildren();
-          status.className = "status error";
-          status.textContent = error.message;
+          setStatus(explain(error), { error: true, retry: true });
         }
       }
 
